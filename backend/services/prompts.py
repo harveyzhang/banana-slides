@@ -3,6 +3,14 @@ AI Service Prompts - 集中管理所有 AI 服务的 prompt 模板
 """
 import json
 import logging
+
+
+def _format_extra_field_instructions(extra_fields: list | None) -> str:
+    """将额外字段列表格式化为 prompt 中的输出要求。"""
+    if not extra_fields:
+        return ''
+    parts = [f'{f}：[关于{f}的建议]' for f in extra_fields]
+    return '\n'.join([''] + parts)  # 前导换行
 from textwrap import dedent
 from typing import List, Dict, Optional, TYPE_CHECKING
 
@@ -106,18 +114,31 @@ def _format_reference_files_xml(reference_files_content: Optional[List[Dict[str,
     return '\n'.join(xml_parts)
 
 
-def _format_requirements(requirements: str) -> str:
-    """格式化用户提供的生成要求，返回可直接拼接到 prompt 中的文本段"""
+def _format_requirements(requirements: str, context: str = "outline") -> str:
+    """格式化用户提供的生成要求，返回可直接拼接到 prompt 中的文本段。
+
+    context: "outline" 或 "description"，用于生成对应的结构标记示例。
+    """
     if requirements and requirements.strip():
+        if context == "description":
+            marker_example = (
+                "For example, if the user asks to avoid certain symbols, "
+                "do NOT use them in the page content, but still use structural markers "
+                "like '页面文字：', '图片素材：', and '<!-- PAGE_END -->' as-is."
+            )
+        else:
+            marker_example = (
+                "For example, if the user asks to avoid '#' symbols, "
+                "do NOT use '#' in the page content, but still use '## Title' as "
+                "the structural heading delimiter between pages."
+            )
         return (
             "<user_requirements>\n"
             f"{requirements.strip()}\n"
             "</user_requirements>\n"
             "Note: The requirements above apply to the generated content of each page and "
             "take precedence over other content-related instructions. The required output format "
-            "and structural markers must still be used as-is. For example, if the user asks to "
-            "avoid '#' symbols, do NOT use '#' in the page content, but still use '## Title' as "
-            "the structural heading delimiter between pages.\n\n"
+            f"and structural markers must still be used as-is. {marker_example}\n\n"
         )
     return ""
 
@@ -350,7 +371,7 @@ Important rules:
 - Extract titles and points from the original text, keeping them exactly as written
 
 Now parse the outline text above into the structured format. Return only the JSON, don't include any other text.
-{get_language_instruction(language)}
+{get_language_instruction(language)} 
 """)
 
     final_prompt = files_xml + prompt
@@ -362,7 +383,8 @@ def get_page_description_prompt(project_context: 'ProjectContext', outline: list
                                 page_outline: dict, page_index: int,
                                 part_info: str = "",
                                 language: str = None,
-                                detail_level: str = "default") -> str:
+                                detail_level: str = "default",
+                                extra_fields: list = None) -> str:
     """
     生成单个页面描述的 prompt
 
@@ -399,27 +421,27 @@ def get_page_description_prompt(project_context: 'ProjectContext', outline: list
             '忠于原文的基础上做到内容详实，逻辑清晰。',
     }
     
-    
+#     页面标题：[实际页面标题]
+# {"副标题：[实际副标题]" if page_index == 1 else ""}
     prompt = (f"""\
 我们正在为PPT的每一页生成内容描述。
 用户的原始需求是：\n{original_input}\n
 我们已经有了完整的大纲：\n{outline}\n{part_info}
-{_format_requirements(project_context.description_requirements)}现在请为第 {page_index} 页生成描述：
+{_format_requirements(project_context.description_requirements, "description")}现在请为第 {page_index} 页生成描述：
 {page_outline}
 {"**除非特殊要求，第一页的内容需要保持极简，只放标题副标题以及演讲人等（输出到标题后）, 不添加任何素材。**" if page_index == 1 else ""}
-
 ## 重要提示
 生成的"页面文字"部分会直接渲染到PPT页面上，因此请务必不要包含任何额外的说明性文字或注释。
 
 ## 输出格式
-页面标题：[实际页面标题]
-{"副标题：[实际副标题]" if page_index == 1 else ""}
 
 页面文字：
-[此处输出页面文字, 细致程度要求：{detail_level_specs[detail_level]}\n\n, 可包含latex公式、表格等内容, 不要重复添加]
+
+[此处使用markdown直接放置正文文字, 细致程度要求：{detail_level_specs[detail_level]}\n\n, 可包含latex公式、表格等内容, 不要重复添加]
 
 图片素材:
 [如果文件中存在图片请积极添加； 否则忽略图片素材字段]
+{_format_extra_field_instructions(extra_fields)}
 
 ## 关于图片
 如果参考文件中包含以 /files/ 开头的本地文件URL图片（例如 /files/mineru/xxx/image.png），请将这些图片以markdown格式输出，例如：![图片描述](/files/mineru/xxx/image.png)。这些图片会被包含在PPT页面中。
@@ -428,6 +450,94 @@ def get_page_description_prompt(project_context: 'ProjectContext', outline: list
 
     final_prompt = files_xml + prompt
     logger.debug(f"[get_page_description_prompt] Final prompt:\n{final_prompt}")
+    return final_prompt
+
+
+def get_all_descriptions_stream_prompt(project_context: 'ProjectContext',
+                                       outline: list,
+                                       flat_pages: list,
+                                       language: str = None,
+                                       detail_level: str = "default",
+                                       extra_fields: list = None) -> str:
+    """
+    一次性生成所有页面描述的 prompt（用于流式生成）
+
+    Args:
+        project_context: 项目上下文对象
+        outline: 完整大纲（可含 part 结构）
+        flat_pages: 扁平化后的页面列表（每项含 title, points, 可选 part）
+        language: 输出语言
+        detail_level: 描述详细程度 (concise/default/detailed)
+
+    Returns:
+        格式化后的 prompt 字符串
+    """
+    files_xml = _format_reference_files_xml(project_context.reference_files_content)
+
+    if project_context.creation_type == 'idea' and project_context.idea_prompt:
+        original_input = project_context.idea_prompt
+    elif project_context.creation_type == 'outline' and project_context.outline_text:
+        original_input = f"用户提供的大纲：\n{project_context.outline_text}"
+    elif project_context.creation_type == 'descriptions' and project_context.description_text:
+        original_input = f"用户提供的描述：\n{project_context.description_text}"
+    else:
+        original_input = project_context.idea_prompt or ""
+
+    detail_level_specs = {
+        'concise': '文字极致地压缩和精简，每条要点用一个核心词语或数据代替，例如效率↑80%',
+        'default': '清晰明了，每条要点控制在15-20字以内, 避免冗长的句子和复杂的表述',
+        'detailed': '忠于原文的基础上做到内容详实，逻辑清晰。',
+    }
+
+    # 构建页面大纲列表
+    outline_lines = []
+    for i, page in enumerate(flat_pages):
+        part_str = f"  [章节: {page['part']}]" if page.get('part') else ""
+        points_str = ", ".join(page.get('points', []))
+        outline_lines.append(f"第 {i + 1} 页：{page.get('title', '')}{part_str}\n  要点：{points_str}")
+    pages_outline_text = "\n".join(outline_lines)
+
+    prompt = (f"""\
+我们正在为PPT的每一页生成内容描述。
+用户的原始需求是：\n{original_input}\n
+完整大纲如下：
+{pages_outline_text}
+
+{_format_requirements(project_context.description_requirements, "description")}请为每一页依次生成描述。先输出 `<!-- BEGIN -->` 标记开始，然后逐页输出内容，每页用 `<!-- PAGE_END -->` 结束，全部完成后输出 `<!-- END -->`。
+
+## 重要提示
+- 生成的页面文字会直接渲染到PPT页面上，请务必不要包含任何额外的说明性文字或注释。
+- **第一页（封面页）保持极简**，只放标题、副标题、演讲人等信息，不添加任何素材。
+- 细致程度要求：{detail_level_specs[detail_level]}
+
+## 输出格式
+每页默认包含"页面文字"和"图片素材"两个部分。图片素材用于引用参考文件中的图片（以 /files/ 开头的本地路径），如果参考文件中没有相关图片则省略该部分。
+```
+<!-- BEGIN -->
+页面文字：
+[第1页文字内容，可包含标题、副标题、要点、latex公式、表格等，根据实际需求选择，避免堆砌和重复]
+
+图片素材：
+[如果参考文件中存在相关图片，以markdown格式引用，如 ![描述](/files/xxx/image.png)；否则省略此部分。如果用户上传了图片素材请积极地添加]
+{_format_extra_field_instructions(extra_fields)}
+<!-- PAGE_END -->
+页面文字：
+[第2页文字内容]
+
+图片素材：
+[同上]
+{_format_extra_field_instructions(extra_fields)}
+<!-- PAGE_END -->
+...
+<!-- END -->
+```
+
+现在请开始生成，严格按照上述格式输出。
+{get_language_instruction(language)}
+""")
+
+    final_prompt = files_xml + prompt
+    logger.debug(f"[get_all_descriptions_stream_prompt] Final prompt:\n{final_prompt}")
     return final_prompt
 
 
@@ -470,7 +580,7 @@ def get_image_generation_prompt(page_desc: str, outline_text: str,
     # 根据是否有模板生成不同的设计指南内容（保持原prompt要点顺序）
     template_style_guideline = "- 配色和设计语言和模板图片严格相似。" if has_template else "- 严格按照风格描述进行设计。"
     forbidden_template_text_guidline = "- 只参考风格设计，禁止出现模板中的文字。\n" if has_template else ""
-
+# - 使用大小恰当的装饰性图形或插画对空缺位置进行填补。
     # 该处参考了@歸藏的A工具箱
     prompt = (f"""\
 你是一位专家级UI UX演示设计师，专注于生成设计良好的PPT页面。
@@ -482,9 +592,9 @@ def get_image_generation_prompt(page_desc: str, outline_text: str,
 <design_guidelines>
 - 要求文字清晰锐利, 画面为4K分辨率，16:9比例。
 {template_style_guideline}
-- 根据内容自动设计最完美的构图，不重不漏地渲染"页面描述"中的文本。
+- 根据内容和要求自动设计最完美的构图，不重不漏地渲染"页面文字"段落中的文本。
 - 如非必要，禁止出现 markdown 格式符号（如 # 和 * 等）。
-{forbidden_template_text_guidline}- 使用大小恰当的装饰性图形或插画对空缺位置进行填补。
+{forbidden_template_text_guidline}
 </design_guidelines>
 {get_ppt_language_instruction(language)}
 {material_images_note}{extra_req_text}
